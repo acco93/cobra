@@ -1,0 +1,311 @@
+/**
+ * Move generators management.
+ */
+
+#ifndef COBRA_MOVEGENERATORS_HPP
+#define COBRA_MOVEGENERATORS_HPP
+
+#include <unordered_set> // that's evil è_é (replace with set if want to keep cross-(compiler,platform,whatever) iteration order
+#include <functional>
+#include <set>
+#include <random>
+#include "Instance.hpp"
+#include "VertexSet.hpp"
+
+namespace cobra {
+
+
+    // Simple counter
+    class TimestampGenerator : private NonCopyable<TimestampGenerator> {
+     public:
+        TimestampGenerator() = default;
+        inline unsigned long get() const { return value; }
+        inline void increment() { ++value; }
+     private:
+        unsigned long value = 0;
+    };
+
+    // Single move generator / static move descriptor
+    class MoveGenerator {
+    public:
+        MoveGenerator(int i, int j) : first_vertex(i), second_vertex(j) {}
+
+        void copy(const MoveGenerator& src) {
+            first_vertex = src.first_vertex;
+            second_vertex = src.second_vertex;
+            delta = src.delta;
+            heap_index = src.heap_index;
+            timestamp = src.timestamp;
+        }
+
+        MoveGenerator (const MoveGenerator & src) {
+            copy(src);
+        };
+        MoveGenerator & operator = (const MoveGenerator & src) {
+            copy(src);
+            return *this;
+        };
+
+        inline auto get_first_vertex() const { return first_vertex; }
+        inline auto get_second_vertex() const { return second_vertex; }
+
+        inline auto get_delta() const { return delta; }
+        inline auto set_delta(float value) { delta = value; }
+
+        inline auto get_heap_index() const { return heap_index; }
+        inline auto set_heap_index(int index) {heap_index = index;}
+
+        inline auto get_timestamp() const { return timestamp; }
+        inline auto set_timestamp(unsigned long value) { timestamp = value; }
+
+     private:
+        int first_vertex;
+        int second_vertex;
+        float delta = 0.0f;
+        int heap_index = -1;
+        unsigned long timestamp = 0;
+
+    };
+
+    class AbstractMoveGeneratorsView; // forward declaration
+    class MoveGeneratorsHeap; // forward declaration
+
+    // Move generators container
+    class MoveGenerators : private NonCopyable<MoveGenerators> {
+
+    public:
+
+        MoveGenerators(const cobra::Instance& instance, std::vector<AbstractMoveGeneratorsView*>& views);
+
+        virtual ~MoveGenerators();
+
+        /**
+         * Returns the move generator indexed `idx`
+         * @param index
+         * @return move generator indexed `idx`
+         */
+        inline MoveGenerator& get(int idx) { return moves[idx]; }
+
+        /**
+         * Set the percentage of move generators to consider in local search procedures
+         * @param percentage float value in [0, 1]
+         * @param vertices for which the percentage value is set
+         */
+        void set_active_percentage(std::vector<float>& percentage, std::vector<int>& vertices);
+
+        /**
+         * Returns the heap used for storing move generators during local search applications
+         * @return heap
+         */
+        inline MoveGeneratorsHeap& get_heap() { return *heap; }
+
+        /**
+         * Returns the vector of move generators
+         * @return vector of move generators
+         */
+        inline std::vector<MoveGenerator>& get_raw_vector() { return moves; }
+
+        /**
+         * Return indices of move generators (a, b) and (b, a) when a = vertex or b = vertex
+         * @param vertex
+         * @return list of indices
+         */
+        inline const std::vector<int>& get_move_generator_indices_involving(int vertex) const { return move_generator_indices_involving[vertex]; }
+
+        /**
+         * Return the timestamp generator
+         * @return timestamp generator
+         */
+        inline TimestampGenerator& get_timestamp_generator() { return timegen; }
+
+        /**
+         * Return the matrix of update bits.
+         * @return
+         */
+        inline Flat2DVector<bool>& get_update_bits() { return update_bits; }
+
+     private:
+
+        const cobra::Instance& instance;
+        std::vector<MoveGenerator> moves;
+        std::vector<AbstractMoveGeneratorsView*>& views;
+        MoveGeneratorsHeap* heap;
+        std::vector<std::vector<int>> move_generator_indices_involving; // summarize view indices without duplicates
+        std::vector<float> prev_percentage;
+
+        TimestampGenerator timegen;
+        Flat2DVector<bool> update_bits;
+
+    };
+
+    // Generic view over a set of move generators
+    class AbstractMoveGeneratorsView : private NonCopyable<AbstractMoveGeneratorsView> {
+
+     public:
+
+        AbstractMoveGeneratorsView(const cobra::Instance& instance_, std::function<std::vector<int>(int)> generator_);
+
+        auto get_generator() -> std::function<std::vector<int>(int)>&;
+
+        auto get_move_generator_indices_involving(int vertex) -> std::vector<int>&;
+
+        /**
+         * During `MoveGenerators` construction, each move generator generated by `generator` is assigned a unique index
+         * within the `moves` vector in `MoveGenerators`. `callback_notify_move_indices` is called during this process to
+         * notify the view about the indices associated with move generators involving `vertex`
+         * @param vertex processing move generators involving `vertex`
+         * @param indices list of unique indices for move generators involving `vertex`
+         */
+        virtual auto callback_notify_move_indices(int vertex, std::vector<int>& indices, MoveGenerators &moves) -> void = 0;
+
+        /**
+         * Notify the view that the `MoveGenerators` object has now completely built the set of move
+         * generators. Views can use this callback to perform post-processing actions.
+         * @param moves
+         */
+        virtual auto callback_notify_build_complete(MoveGenerators& moves) -> void = 0;
+
+        virtual auto set_active_percentage(std::vector<float>& percentage, std::vector<int>& vertices, MoveGenerators& moves, cobra::VertexSet& vertices_in_updated_moves) -> void = 0;
+
+        auto get_number_of_moves() -> int {
+
+            auto set = std::set<int>();
+            for(auto i = instance.get_vertices_begin(); i < instance.get_vertices_end(); i++) {
+                for(auto id : all_move_generator_indices_involving[i]) {
+                    set.insert(id);
+                }
+            }
+            return 2 * static_cast<int>(set.size()); // '2 *' because we are storing a single copy between (i, j) and (j,i)
+
+        }
+
+        inline auto is_active(int move_idx) {
+            assert(move_map.count(move_idx));
+            const auto mapped_idx = move_map[move_idx];
+            return active_in[mapped_idx].first || active_in[mapped_idx].second;
+        }
+
+     protected:
+
+        const cobra::Instance& instance;
+        std::vector<std::vector<int>> move_generator_indices_involving;     // store, for each vertex i, the index of ACTIVE move generators (i, j) or (j, i) defined by the view
+        std::vector<std::vector<int>> all_move_generator_indices_involving; // store, for each vertex i, the index of ALL move generators (i, j) or (j, i) defined by the view
+
+        std::unordered_map<int, int> move_map;
+        std::vector<std::pair<bool, bool>> active_in;
+
+        void setup_active_trackers();
+
+        inline auto set_active_in(const MoveGenerator& move, int move_idx, int vertex) {
+            assert(move_map.count(move_idx));
+            const auto mapped_idx = move_map[move_idx];
+            assert(vertex == move.get_first_vertex() || vertex == move.get_second_vertex());
+            if (vertex == move.get_first_vertex()) { active_in[mapped_idx].first = true; }
+            else { active_in[mapped_idx].second = true; }
+        }
+
+        inline auto set_not_active_in(const MoveGenerator& move, int move_idx, int vertex) {
+            assert(move_map.count(move_idx));
+            const auto mapped_idx = move_map[move_idx];
+            assert(vertex == move.get_first_vertex() || vertex == move.get_second_vertex());
+            if (vertex == move.get_first_vertex()) { active_in[mapped_idx].first = false; }
+            else { active_in[mapped_idx].second = false; }
+        }
+
+        inline auto is_active_in(const MoveGenerator& move, int move_idx, int vertex) {
+            assert(move_map.count(move_idx));
+            const auto mapped_idx = move_map[move_idx];
+            assert(vertex == move.get_first_vertex() || vertex == move.get_second_vertex());
+            if (vertex == move.get_first_vertex()) { return active_in[mapped_idx].first; }
+            else { return active_in[mapped_idx].second; }
+        }
+
+        inline auto is_active_in_other(const MoveGenerator& move, int move_idx, int vertex) {
+            assert(move_map.count(move_idx));
+            const auto mapped_idx = move_map[move_idx];
+            assert(vertex == move.get_first_vertex() || vertex == move.get_second_vertex());
+            if (vertex == move.get_first_vertex()) { return active_in[mapped_idx].second; }
+            else { return active_in[mapped_idx].first; }
+        }
+
+     private:
+        std::function<std::vector<int>(int)> generator;
+
+    };
+
+    // AbstractMoveGeneratorsView implementation identifying move generators (i, a) and (a, i) for each i, with a being
+    // among the k nearest vertices of i
+    class KNeighborsMoveGeneratorsView : public AbstractMoveGeneratorsView {
+
+    public:
+
+        KNeighborsMoveGeneratorsView(const cobra::Instance& instance, int k);
+
+     private:
+
+        const int max_neighbors_num; // k max, `set_active_percentage` can be used to vary 0 <= k <= k max
+        std::vector<int> curr_neighbors_num; // current k
+
+        void callback_notify_move_indices(int vertex, std::vector<int>& indices, MoveGenerators &moves) override;
+        void callback_notify_build_complete(MoveGenerators &moves) override;
+        void set_active_percentage(std::vector<float>& percentage, std::vector<int>& vertices, MoveGenerators& moves, cobra::VertexSet& vertices_in_updated_moves) override;
+
+    };
+
+    // AbstractMoveGeneratorsView implementation identifying move generators in increasing arc cost order (as in the
+    // standard implementation).
+    class CostBasedMoveGeneratorsView : public AbstractMoveGeneratorsView {
+
+     public:
+
+        CostBasedMoveGeneratorsView(const cobra::Instance& instance, std::function<std::vector<int>(int)> generator);
+
+     private:
+
+        std::vector<int> flat_indices;
+        std::vector<float> curr_percentage;
+        std::vector<std::vector<float>> inclusion_percentage;
+        std::vector<int> curr_num;
+
+        void callback_notify_move_indices([[maybe_unused]] int vertex, std::vector<int>& indices, MoveGenerators &moves) override;
+
+        void callback_notify_build_complete(MoveGenerators& moves) override;
+
+        void set_active_percentage(std::vector<float>& percentage, std::vector<int>& vertices, MoveGenerators& moves, cobra::VertexSet& vertices_in_updated_moves) override;
+
+    };
+
+    // Heap storing move generators (indices)
+    class MoveGeneratorsHeap : private NonCopyable<MoveGeneratorsHeap> {
+
+    public:
+        explicit MoveGeneratorsHeap(MoveGenerators& moves);
+        virtual ~MoveGeneratorsHeap();
+
+        void reset();
+        bool is_empty() const;
+        void insert(int move_index);
+        int get();
+        void remove(int move_index);
+        void change_value(int move_index, float value);
+        int size() const;
+        int spy(int heap_index) const;
+
+        static const int unheaped;
+
+     private:
+
+        std::vector<MoveGenerator>& moves;
+        int* heap;
+        int heap_len;
+
+        void heapify(int heap_index);
+        void upsift(int heap_index);
+        bool is_heap();
+        void dump();
+
+    };
+
+}
+
+#endif //COBRA_MOVEGENERATORS_HPP
